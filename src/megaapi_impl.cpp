@@ -18818,23 +18818,49 @@ unsigned MegaApiImpl::sendPendingTransfers(TransferQueue *queue, MegaRecursiveOp
                             forceToUpload= hasToForceUpload(*previousNode.get(), *transfer);
                             if (!forceToUpload)
                             {
-                                LOG_debug << "Previous node exists and the upload is not forced: "
+                                // Enhanced security: Verify with MAC before skipping upload
+                                bool safeToCopy = false;
+                                
+                                auto fa = fingerprintingFsAccess.newfileaccess();
+                                if (fa->fopen(LocalPath::fromAbsolutePath(localPath), true, false, FSLogging::logOnError))
+                                {
+                                    if (CompareLocalFileMetaMacWithNode(fa.get(), previousNode.get()))
+                                    {
+                                        LOG_info << "MAC verification passed - files are identical, safe to copy";
+                                        safeToCopy = true;
+                                    }
+                                    else
+                                    {
+                                        LOG_warn << "Fingerprint match but MAC mismatch - files differ, proceeding with upload";
+                                        forceToUpload = true;
+                                    }
+                                }
+                                else
+                                {
+                                    LOG_warn << "Cannot read local file for MAC verification - proceeding with upload";
+                                    forceToUpload = true;
+                                }
+
+                                if (safeToCopy)
+                                {
+                                    LOG_debug << "Previous node exists and MAC verification passed: "
                                              "copy node handle";
-                                transfer->setState(MegaTransfer::STATE_QUEUED);
-                                transferMap[nextTag] = transfer;
-                                transfer->setTag(nextTag);
-                                transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
-                                transfer->setTransferredBytes(0);
-                                transfer->setStartTime(Waiter::ds);
-                                transfer->setUpdateTime(Waiter::ds);
-                                fireOnTransferStart(transfer);
-                                transfer->setNodeHandle(previousNode->nodehandle);
-                                transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
-                                transfer->setSpeed(0);
-                                transfer->setMeanSpeed(0);
-                                transfer->setState(MegaTransfer::STATE_COMPLETED);
-                                fireOnTransferFinish(transfer, std::make_unique<MegaErrorPrivate>(API_OK));
-                                break;
+                                    transfer->setState(MegaTransfer::STATE_QUEUED);
+                                    transferMap[nextTag] = transfer;
+                                    transfer->setTag(nextTag);
+                                    transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
+                                    transfer->setTransferredBytes(0);
+                                    transfer->setStartTime(Waiter::ds);
+                                    transfer->setUpdateTime(Waiter::ds);
+                                    fireOnTransferStart(transfer);
+                                    transfer->setNodeHandle(previousNode->nodehandle);
+                                    transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
+                                    transfer->setSpeed(0);
+                                    transfer->setMeanSpeed(0);
+                                    transfer->setState(MegaTransfer::STATE_COMPLETED);
+                                    fireOnTransferFinish(transfer, std::make_unique<MegaErrorPrivate>(API_OK));
+                                    break;
+                                }
                             }
                         }
                     }
@@ -18845,54 +18871,80 @@ unsigned MegaApiImpl::sendPendingTransfers(TransferQueue *queue, MegaRecursiveOp
                         std::shared_ptr<Node> samenode = client->mNodeManager.getNodeByFingerprint(fp_forCloud);
                         if (samenode && samenode->nodekey().size() && !hasToForceUpload(*samenode, *transfer))
                         {
-                            transfer->setState(MegaTransfer::STATE_QUEUED);
-                            transferMap[nextTag] = transfer;
-                            transfer->setTag(nextTag);
-                            transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
-                            transfer->setStartTime(Waiter::ds);
-                            transfer->setUpdateTime(Waiter::ds);
-                            fireOnTransferStart(transfer);
-
-                            TreeProcCopy tc;
-                            client->proctree(samenode, &tc, false, true);
-                            tc.allocnodes();
-                            client->proctree(samenode, &tc, false, true);
-                            tc.nn[0].parenthandle = UNDEF;
-
-                            SymmCipher key;
-                            AttrMap attrs;
-                            string attrstring;
-                            key.setkey((const byte*)tc.nn[0].nodekey.data(), samenode->type);
-                            attrs = samenode->attrs;
-                            string sname = fileName;
-                            LocalPath::utf8_normalize(&sname);
-                            attrs.map['n'] = sname;
-                            attrs.getjson(&attrstring);
-                            client->makeattr(&key, tc.nn[0].attrstring, attrstring.c_str());
-                            if (tc.nn[0].type == FILENODE)
+                            // Enhanced security: Verify with MAC before copying existing node
+                            bool safeToCopy = false;
+                            
+                            auto fa = fingerprintingFsAccess.newfileaccess();
+                            if (fa->fopen(LocalPath::fromAbsolutePath(localPath), true, false, FSLogging::logOnError))
                             {
-                                if (std::shared_ptr<Node> ovn = client->getovnode(parent.get(), &sname))
+                                if (CompareLocalFileMetaMacWithNode(fa.get(), samenode.get()))
                                 {
-                                    tc.nn[0].ovhandle = ovn->nodeHandle();
+                                    LOG_info << "Global fingerprint match with MAC verification passed - safe to copy existing node";
+                                    safeToCopy = true;
                                 }
-                            }
-
-                            if (uploadToInbox)
-                            {
-                                // obsolete feature, kept for sending logs to helpdesk
-                                client->putnodes(inboxTarget, std::move(tc.nn), nextTag);
+                                else
+                                {
+                                    LOG_warn << "Global fingerprint match but MAC mismatch - files differ, proceeding with upload";
+                                    safeToCopy = false;
+                                }
                             }
                             else
                             {
-                                client->putnodes(parent->nodeHandle(), UseLocalVersioningFlag, std::move(tc.nn), nullptr, nextTag, false);
+                                LOG_warn << "Cannot read local file for MAC verification - proceeding with upload";
+                                safeToCopy = false;
                             }
 
-                            transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
-                            transfer->setSpeed(0);
-                            transfer->setMeanSpeed(0);
-                            transfer->setState(MegaTransfer::STATE_COMPLETING);
-                            fireOnTransferUpdate(transfer);
-                            break;
+                            if (safeToCopy)
+                            {
+                                transfer->setState(MegaTransfer::STATE_QUEUED);
+                                transferMap[nextTag] = transfer;
+                                transfer->setTag(nextTag);
+                                transfer->setTotalBytes(transfer->fingerprint_onDisk.size);
+                                transfer->setStartTime(Waiter::ds);
+                                transfer->setUpdateTime(Waiter::ds);
+                                fireOnTransferStart(transfer);
+
+                                TreeProcCopy tc;
+                                client->proctree(samenode, &tc, false, true);
+                                tc.allocnodes();
+                                client->proctree(samenode, &tc, false, true);
+                                tc.nn[0].parenthandle = UNDEF;
+
+                                SymmCipher key;
+                                AttrMap attrs;
+                                string attrstring;
+                                key.setkey((const byte*)tc.nn[0].nodekey.data(), samenode->type);
+                                attrs = samenode->attrs;
+                                string sname = fileName;
+                                LocalPath::utf8_normalize(&sname);
+                                attrs.map['n'] = sname;
+                                attrs.getjson(&attrstring);
+                                client->makeattr(&key, tc.nn[0].attrstring, attrstring.c_str());
+                                if (tc.nn[0].type == FILENODE)
+                                {
+                                    if (std::shared_ptr<Node> ovn = client->getovnode(parent.get(), &sname))
+                                    {
+                                        tc.nn[0].ovhandle = ovn->nodeHandle();
+                                    }
+                                }
+
+                                if (uploadToInbox)
+                                {
+                                    // obsolete feature, kept for sending logs to helpdesk
+                                    client->putnodes(inboxTarget, std::move(tc.nn), nextTag);
+                                }
+                                else
+                                {
+                                    client->putnodes(parent->nodeHandle(), UseLocalVersioningFlag, std::move(tc.nn), nullptr, nextTag, false);
+                                }
+
+                                transfer->setDeltaSize(transfer->fingerprint_onDisk.size);
+                                transfer->setSpeed(0);
+                                transfer->setMeanSpeed(0);
+                                transfer->setState(MegaTransfer::STATE_COMPLETING);
+                                fireOnTransferUpdate(transfer);
+                                break;
+                            }  // close if (safeToCopy)
                         }
                     }
 
