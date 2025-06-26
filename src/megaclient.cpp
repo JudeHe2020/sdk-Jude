@@ -2912,6 +2912,16 @@ void MegaClient::exec()
             }
         }
 
+        //in middle of prossing sc, when new data come and HttpReq::put invoke in.append, pendingsc->in may reallocate new memorry
+        if (jsonscConsumeBytes > 0 && pendingsc && pendingsc->mChunked)
+        {
+            if (jsonsc.pos != pendingsc->in.c_str())
+            {
+                jsonsc.begin(pendingsc->in.c_str());
+               
+            }
+        }
+
         // handle API server-client requests
         if (!jsonsc.pos && !pendingscUserAlerts && pendingsc)
         {
@@ -2935,9 +2945,10 @@ void MegaClient::exec()
                     btsc.reset();
                     break;
                 }
-
-                if (*pendingsc->in.c_str() == '{')
+                
+                if (*pendingsc->in.c_str() == '{' && pendingsc->mChunked && !jsonsc.pos)
                 {
+                    jsonscConsumeBytes = 0;
                     insca = false;
                     insca_notlast = false;
                     jsonsc.begin(pendingsc->in.c_str());
@@ -3054,6 +3065,26 @@ void MegaClient::exec()
                     pendingsc.reset();
                     btsc.reset();
                 }
+                else
+                {
+                    if (pendingsc && pendingsc->mChunked && pendingsc->contentlength > 0)
+                    {
+                        LOG_debug << pendingsc->getLogName()
+                                  << " is still inflight, pendingsc contentlength="
+                                  << pendingsc->contentlength
+                                  << ", in.sise=" << pendingsc->in.size();
+
+                        if (*pendingsc->in.c_str() == '{' && !jsonsc.pos)
+                        {
+                            insca = false;
+                            insca_notlast = false;
+                            jsonscConsumeBytes = 0;
+                            jsonsc.begin(pendingsc->in.c_str());
+                            jsonsc.enterobject();
+                        }
+                    }
+
+                }
                 break;
             default:
                 break;
@@ -3062,14 +3093,71 @@ void MegaClient::exec()
 
         if (!scpaused && jsonsc.pos)
         {
+            // JSON obj start with '{' and end with '},'
+            // if pendingsc->in not end with '},' then cut last part string off
+            // and store to lastUncompletedJsonObj for next round processing
+            string lastUncompletedJsonObj;
+            bool foundBoundery = false;
+            if ( (jsonscConsumeBytes+pendingsc->in.size()) < pendingsc->contentlength)
+            {
+                auto startPos = pendingsc->in.c_str();
+                auto lastPos = startPos + pendingsc->in.size() - 1;
+                
+                
+                while (lastPos > startPos)
+                {
+                    if(*lastPos == ',' && *(lastPos-1) == '}')
+                    {
+                        foundBoundery=true;
+                        break;
+                    }
+                    lastPos--;
+                }
+                if(foundBoundery)
+                {
+                    lastUncompletedJsonObj = string(lastPos + 1);
+                    auto offset = lastPos + 1 - startPos;
+                    pendingsc->in.erase(offset);
+                }
+
+                              
+            }
+
+            
             // FIXME: reload in case of bad JSON
             if (procsc())
             {
                 // completed - initiate next SC request
+                jsonscConsumeBytes = 0;               
                 jsonsc.pos = nullptr;
                 pendingsc.reset();
-                btsc.reset();
+                btsc.reset();    
             }
+            else
+            {
+                if (jsonsc.pos > pendingsc->in.c_str())
+                {
+                    //remove comsumeBytes from pendingsc->in
+                    auto comsumeBytes = jsonsc.pos - pendingsc->in.c_str() + 1;
+                    pendingsc->purge(comsumeBytes);
+                    jsonscConsumeBytes += comsumeBytes;
+                    //reset pendingsc->in with lastUncompletedJsonObj
+                    pendingsc->in.append(lastUncompletedJsonObj);
+                    jsonsc.begin(pendingsc->in.c_str());
+                    
+                }
+    
+                if (jsonscConsumeBytes >= pendingsc->contentlength)
+                {
+                    // completed - initiate next SC request
+                    jsonscConsumeBytes = 0;               
+                    jsonsc.pos = nullptr;
+                    pendingsc.reset();
+                    btsc.reset();
+                }
+            }
+            
+            
         }
 
         if (!pendingsc && !pendingscUserAlerts && scsn.ready() && btsc.armed() && !mBlocked)
@@ -3123,6 +3211,7 @@ void MegaClient::exec()
                 }
 
                 pendingsc->type = REQ_JSON;
+                pendingsc->mChunked = true;
                 pendingsc->post(this);
             }
             jsonsc.pos = NULL;
@@ -5107,9 +5196,18 @@ bool MegaClient::procsc()
                     break;
 
                 case EOO:
-                    if (!useralerts.isDeletedSharedNodesStashEmpty())
+      
+                    if ( pendingsc->status==REQ_INFLIGHT)
                     {
-			useralerts.purgeNodeVersionsFromStash();
+                        //this is no real EOO, more content in fly
+                        return false;
+                    }
+                    
+
+
+                    if (!useralerts.isDeletedSharedNodesStashEmpty())
+                    {   
+			            useralerts.purgeNodeVersionsFromStash();
                         useralerts.convertStashedDeletedSharedNodes();
                     }
 
@@ -5567,8 +5665,18 @@ bool MegaClient::procsc()
                 // It will also process the latest command response associated (by the Sequence Tag)
                 // with the latest AP processed here.
                 sc_checkSequenceTag(string());
-                jsonsc.leavearray();
-                insca = false;
+                if (*jsonsc.pos == ']' && *(jsonsc.pos+1)==',')
+                {
+                    jsonsc.leavearray();
+                    insca = false;                          
+                }
+                else
+                {
+                    //incomplite Packets, restore jsonsc.pos and wait more data come
+                    jsonsc.pos = actionpacketStart;
+                    return false;
+                }
+
             }
         }
     }

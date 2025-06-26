@@ -2067,6 +2067,7 @@ public:
 
     // Server-MegaClient request JSON and processing state flag ("processing a element")
     JSON jsonsc;
+    m_off_t jsonscConsumeBytes = 0;
     bool insca;
     bool insca_notlast;
 
